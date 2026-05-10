@@ -1,0 +1,47 @@
+# Build artifacts — CMake / binary
+build/
+**/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.dylib
+
+# Compiled binaries
+llm_gateway
+kimi_client
+*.exe
+*.out
+*.app
+
+# Runtime logs & temp
+**/logs/
+**/uploads/**
+**/tmp/
+*.log
+core
+**/core
+*.core
+
+# Editor & IDE
+.vscode/
+.idea/
+.project
+.classpath
+.settings/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Claude Code local settings
+.claude/settings.local.json
+**/.claude/settings.local.json
