@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Gateway</title>
+<style>
+:root{--bg:#1a1a2e;--panel:#16213e;--accent:#0f3460;--hl:#e94560;--text:#eee;--muted:#aaa;--border:#333;--green:#4caf50;--orange:#ff9800}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;height:100vh;overflow:hidden}
+/* sidebar */
+.sidebar{width:260px;background:var(--panel);padding:16px;display:flex;flex-direction:column;gap:12px;border-right:1px solid var(--border);flex-shrink:0}
+.sidebar h2{font-size:16px;color:var(--hl)}
+.sidebar label{font-size:11px;color:var(--muted);text-transform:uppercase}
+.sidebar input,.sidebar select,.sidebar button{width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px}
+.sidebar button{cursor:pointer;font-weight:600;transition:.15s}
+.sidebar button:hover{filter:brightness(1.2)}
+.btn-connect{background:var(--green);border-color:var(--green)}
+.btn-disconnect{background:var(--hl);border-color:var(--hl)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.dot-ok{background:var(--green)}
+.dot-err{background:var(--hl)}
+.status{font-size:12px;color:var(--muted);display:flex;align-items:center}
+/* main */
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+.messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.msg{padding:10px 14px;border-radius:8px;max-width:85%;word-break:break-word;white-space:pre-wrap}
+.msg-user{align-self:flex-end;background:var(--accent)}
+.msg-assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
+.msg-tool{align-self:flex-start;background:#1a3a1a;border:1px solid var(--green);font-size:12px}
+.msg-tool .name{color:var(--green);font-weight:600}
+.msg-tool .args{color:var(--muted)}
+.msg-tool .result{color:var(--orange);margin-top:4px}
+.msg-system{align-self:center;font-size:11px;color:var(--muted)}
+/* input */
+.input-area{display:flex;gap:8px;padding:12px 20px;border-top:1px solid var(--border);background:var(--panel)}
+.input-area textarea{flex:1;resize:none;padding:10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;max-height:120px;min-height:40px}
+.input-area button{padding:0 20px;border-radius:6px;border:none;background:var(--hl);color:#fff;font-weight:600;cursor:pointer;font-size:13px}
+.input-area button:hover{filter:brightness(1.15)}
+.input-area button:disabled{opacity:.5;cursor:not-allowed}
+</style>
+</head>
+<body>
+
+<aside class=sidebar>
+  <h2>LLM Gateway</h2>
+  <div class=status><span class=dot id=dot></span><span id=status-text>未连接</span></div>
+  <button class=btn-connect id=btn-conn onclick=toggle()>连接</button>
+  <label>Host</label>
+  <input id=host value="">
+  <label>API Key</label>
+  <input id=apikey value="test-key-123">
+  <label>Model</label>
+  <select id=model><option>local-model</option><option>big-model</option></select>
+  <label>Temperature</label>
+  <input id=temp value="0.7" type=number step=0.1 min=0 max=2>
+  <label>Max Tokens</label>
+  <input id=maxtok value="2048" type=number min=1 max=32768>
+  <label style="margin-top:8px">Tools <span style="color:var(--green);font-size:10px">(默认Windows工具)</span></label>
+  <textarea id=tools rows=9 style="font-size:11px;font-family:monospace" readonly>[{"type":"function","function":{"name":"run_command","description":"运行Windows命令","parameters":{"type":"object","properties":{"cmd":{"type":"string","description":"要执行的命令"}},"required":["cmd"]}}},{"type":"function","function":{"name":"open_app","description":"打开Windows应用","parameters":{"type":"object","properties":{"app":{"type":"string","description":"应用名如notepad,calc,mspaint"}},"required":["app"]}}},{"type":"function","function":{"name":"write_file","description":"写入文件","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"vscode_command","description":"执行VS Code命令","parameters":{"type":"object","properties":{"command":{"type":"string","description":"VS Code命令ID，如workbench.action.files.newFile, workbench.action.find, editor.action.formatDocument"}},"required":["command"]}}}]</textarea>
+</aside>
+
+<div class=main>
+  <div class=messages id=msgs></div>
+  <div class=input-area>
+    <textarea id=input rows=1 placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" onkeydown="onKey(event)"></textarea>
+    <button id=btn-send onclick=sendChat() disabled>发送</button>
+  </div>
+</div>
+
+<script>
+let conn = null, rid = 0, session = '';
+
+// 自动填入当前页面 host
+function init(){
+  $('host').value = window.location.host;
+  // 页面加载后自动连接
+  setTimeout(toggle, 300);
+}
+window.addEventListener('DOMContentLoaded', init);
+
+function $(id){return document.getElementById(id)}
+function dot(ok){$('dot').className='dot '+(ok?'dot-ok':'dot-err')}
+
+function log(cls, html){
+  const d = document.createElement('div'); d.className = 'msg '+cls; d.innerHTML = html;
+  $('msgs').appendChild(d); $('msgs').scrollTop = $('msgs').scrollHeight;
+  return d
+}
+
+function toggle(){
+  if(conn){ conn.close(); return }
+  const host = $('host').value, key = $('apikey').value;
+  conn = new WebSocket('ws://'+host+'/ws/chat?key='+encodeURIComponent(key));
+  conn.onopen = ()=>{
+    dot(true); $('status-text').textContent='已连接';
+    $('btn-conn').textContent='断开'; $('btn-conn').className='btn-disconnect';
+    $('btn-send').disabled=false;
+    log('system','&#10003; 已连接');
+  };
+  conn.onclose = ()=>{
+    dot(false); $('status-text').textContent='已断开';
+    $('btn-conn').textContent='连接'; $('btn-conn').className='btn-connect';
+    $('btn-send').disabled=true;
+    log('system','&#10007; 已断开'); conn=null;
+  };
+  conn.onmessage = (e)=>{
+    const msg = JSON.parse(e.data);
+    switch(msg.type){
+    case 'connected':
+      session = msg.session_id;
+      break;
+    case 'token':
+      let el = document.getElementById('tok-'+msg.request_id);
+      if(!el){ el = log('assistant',''); el.id = 'tok-'+msg.request_id }
+      el.textContent += msg.content;
+      break;
+    case 'done':
+      log('system','&#10003; 完成 ['+msg.request_id+']');
+      break;
+    case 'error':
+      log('system','&#10007; 错误 ['+msg.request_id+']: '+msg.code+' - '+(msg.message||''));
+      break;
+    case 'abort':
+      log('system','&#9888; 拦截 ['+msg.request_id+'] HTTP '+msg.status+': '+msg.body);
+      break;
+    case 'tool_call':
+      log('tool','&#9874; <span class=name>'+msg.name+'</span><br><span class=args>'+JSON.stringify(msg.arguments)+'</span>');
+      break;
+    case 'tool_result':
+      log('tool','&#9874; 结果 ['+msg.call_id+']:<br><span class=result>'+msg.content+'</span>');
+      break;
+    case 'pong': break;
+    }
+  };
+}
+
+function onKey(e){
+  if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendChat() }
+}
+
+function sendChat(){
+  if(!conn) return;
+  const text = $('input').value.trim(); if(!text) return;
+  rid++; const reqId = 'r'+rid;
+  const req = {
+    type:'chat', request_id:reqId, model:$('model').value,
+    messages:[{role:'user',content:text}],
+    temperature:parseFloat($('temp').value)||0.7,
+    max_tokens:parseInt($('maxtok').value)||2048
+  };
+  // 带上 tools
+  try { const t = JSON.parse($('tools').value); if(t.length) req.tools = t } catch(e){}
+  conn.send(JSON.stringify(req));
+  log('user',text);
+  $('input').value='';
+}
+
+// tool test: 手动发 tool_call，模拟调用 executor
+function sendTool(){
+  if(!conn) return;
+  const name = prompt('工具名:','run_command');
+  if(!name) return;
+  const args = prompt('参数 JSON:','{"cmd":"notepad"}');
+  rid++; const reqId = 'r'+rid, callId = 'c'+Date.now();
+  conn.send(JSON.stringify({type:'tool_call',request_id:reqId,call_id:callId,name:name,arguments:JSON.parse(args||'{}')}));
+  log('system','&#9874; tool_call: '+name+' '+args);
+}
+
+// keep-alive
+setInterval(()=>{ if(conn&&conn.readyState===WebSocket.OPEN) conn.send('{"type":"ping"}') },25000);
+</script>
+</body>
+</html>

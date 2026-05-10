@@ -1,0 +1,59 @@
+{
+  "listeners": [
+    {
+      "address": "0.0.0.0",
+      "port": 8080,
+      "https": false
+    }
+  ],
+  "app": {
+    "threads_num": 4,
+    "enable_session": false,
+    "document_root": "./static",
+    "home_page": "index.html",
+    "use_implicit_page": false,
+    "max_connections": 10000,
+    "max_requests_per_connection": 0,
+    "client_max_body_size": "2M",
+    "server_header_field": "LLM-Gateway/2.0",
+    "keepalive_requests_number": 100,
+    "keepalive_timeout": 60,
+    "pipelining_requests_number": 0,
+    "gzip": true,
+    "br": false,
+    "idle_connection_timeout": 60
+  },
+  "plugins_dir": "plugins",
+  "lua_pool_size": 8,
+  "upstream_type": "remote",
+  "upstream": {
+    "connect_timeout": 15,
+    "request_timeout": 120
+  },
+  "backends": [
+    {
+      "name": "llama-05b",
+      "url": "http://127.0.0.1:8300/v1/chat/completions",
+      "api_key": "",
+      "model": "local-model",
+      "weight": 1,
+      "route_model": "local-model"
+    },
+    {
+      "name": "llama-7b",
+      "url": "http://127.0.0.1:8200/v1/chat/completions",
+      "api_key": "",
+      "model": "big-model",
+      "weight": 1,
+      "route_model": "big-model"
+    }
+  ],
+  "api_keys": [
+    {
+      "key": "test-key-123",
+      "models": "*",
+      "qps": 60,
+      "enabled": true
+    }
+  ]
+}

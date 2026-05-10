@@ -1,0 +1,1 @@
+./llama-server -m medical_q5km.gguf -c 512 --n-gpu-layers 0 -t 2 --host 0.0.0.0

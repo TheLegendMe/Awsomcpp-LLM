@@ -11,8 +11,9 @@ Makefile
 *.dylib
 
 # Compiled binaries
-llm_gateway
+#llm_gateway
 kimi_client
+kimi_client.cpp
 *.exe
 *.out
 *.app
