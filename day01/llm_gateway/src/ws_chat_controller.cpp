@@ -152,7 +152,26 @@ void WsChatController::handleNewMessage(
                     if (!name.empty()) {
                         ctx->tools.push_back(name);
                         std::string desc = t.value("description", "");
-                        std::string params = t.contains("parameters") ? t["parameters"].dump() : "{}";
+                        // 自动转完整 JSON Schema：{"key":"type"} → {"type":"object","properties":{...}}
+                        std::string params = "{}";
+                        if (t.contains("parameters") && t["parameters"].is_object()) {
+                            auto& p = t["parameters"];
+                            if (p.contains("type")) {
+                                params = p.dump();  // 已是完整 schema
+                            } else {
+                                // 简化格式，自动包装
+                                json schema = {{"type","object"}};
+                                json props = json::object();
+                                for (auto& [k, v] : p.items()) {
+                                    if (v.is_string())
+                                        props[k] = {{"type", v.get<std::string>()}};
+                                    else
+                                        props[k] = v;
+                                }
+                                schema["properties"] = props;
+                                params = schema.dump();
+                            }
+                        }
                         ToolRegistry::instance().add(name, desc, params, ctx->session_id);
                     }
                 }

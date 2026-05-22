@@ -56,8 +56,8 @@ body{font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
   <input id=temp value="0.7" type=number step=0.1 min=0 max=2>
   <label>Max Tokens</label>
   <input id=maxtok value="2048" type=number min=1 max=32768>
-  <label style="margin-top:8px">Tools <span style="color:var(--green);font-size:10px">(默认Windows工具)</span></label>
-  <textarea id=tools rows=9 style="font-size:11px;font-family:monospace" readonly>[{"type":"function","function":{"name":"run_command","description":"运行Windows命令","parameters":{"type":"object","properties":{"cmd":{"type":"string","description":"要执行的命令"}},"required":["cmd"]}}},{"type":"function","function":{"name":"open_app","description":"打开Windows应用","parameters":{"type":"object","properties":{"app":{"type":"string","description":"应用名如notepad,calc,mspaint"}},"required":["app"]}}},{"type":"function","function":{"name":"write_file","description":"写入文件","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"vscode_command","description":"执行VS Code命令","parameters":{"type":"object","properties":{"command":{"type":"string","description":"VS Code命令ID，如workbench.action.files.newFile, workbench.action.find, editor.action.formatDocument"}},"required":["command"]}}}]</textarea>
+  <label style="margin-top:8px">Tools <span style="color:var(--green);font-size:10px">(executor注册后自动出现)</span></label>
+  <div id=tools-list style="font-size:11px;color:var(--muted);max-height:120px;overflow-y:auto"></div>
 </aside>
 
 <div class=main>
@@ -71,11 +71,22 @@ body{font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text);d
 <script>
 let conn = null, rid = 0, session = '';
 
-// 自动填入当前页面 host
+// 自动填入当前页面 host，动态拉取工具列表
 function init(){
   $('host').value = window.location.host;
-  // 页面加载后自动连接
   setTimeout(toggle, 300);
+  refreshTools();
+  setInterval(refreshTools, 5000);  // 每5s刷新
+}
+async function refreshTools(){
+  try {
+    const r = await fetch('/tools');
+    const tools = await r.json();
+    const names = tools.map(t=>t.function.name);
+    $('tools-list').innerHTML = names.length
+      ? names.map(n=>'<span style="color:var(--green)">&#9874;</span> '+n).join('<br>')
+      : '<span style="color:var(--muted)">等待executor注册...</span>';
+  } catch(e){}
 }
 window.addEventListener('DOMContentLoaded', init);
 
@@ -149,8 +160,7 @@ function sendChat(){
     temperature:parseFloat($('temp').value)||0.7,
     max_tokens:parseInt($('maxtok').value)||2048
   };
-  // 带上 tools
-  try { const t = JSON.parse($('tools').value); if(t.length) req.tools = t } catch(e){}
+  // 不显式传 tools，网关自动从 ToolRegistry 注入
   conn.send(JSON.stringify(req));
   log('user',text);
   $('input').value='';

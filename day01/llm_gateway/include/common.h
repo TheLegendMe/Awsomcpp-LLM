@@ -122,15 +122,28 @@ inline std::string ToolRegistry::tools_json() const {
     std::lock_guard<std::mutex> lk(mu_);
     nlohmann::json arr = nlohmann::json::array();
     for (auto& e : entries_) {
+        // 解析并清理 parameters schema
+        nlohmann::json params;
+        try {
+            params = nlohmann::json::parse(
+                e.def.parameters_json.empty() ? "{}" : e.def.parameters_json);
+        } catch (...) { params = nlohmann::json::object(); }
+        if (!params.is_object()) params = nlohmann::json::object();
+        if (!params.contains("type") || params["type"] != "object")
+            params["type"] = "object";
+        if (!params.contains("properties") || !params["properties"].is_object())
+            params["properties"] = nlohmann::json::object();
+        if (!params.contains("required") || !params["required"].is_array())
+            params["required"] = nlohmann::json::array();
+
         arr.push_back({
             {"type", "function"},
             {"function", {
                 {"name", e.def.name},
                 {"description", e.def.description},
-                {"parameters", nlohmann::json::parse(e.def.parameters_json.empty() ?
-                    "{\"type\":\"object\",\"properties\":{}}" : e.def.parameters_json)
+                {"parameters", params}
             }}
-        }});
+        });
     }
     return arr.dump();
 }
