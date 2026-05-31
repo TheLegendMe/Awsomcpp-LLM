@@ -16,7 +16,7 @@ end
 function on_request(ctx)
     -- IP 黑名单检查
     if blocked_ips[ctx.user_ip] then
-        ctx:set_response(403, '{"error":"ip blocked"}')
+        ctx.set_response(403, '{"error":"ip blocked"}')
         return "ABORT_EARLY"
     end
 

@@ -61,6 +61,7 @@ void SSEParser::process_line(const std::string& line) {
 
             // finish_reason == "tool_calls" → 触发 tool_call 回调
             if (c0.contains("finish_reason") &&
+                c0["finish_reason"].is_string() &&
                 c0["finish_reason"].get<std::string>() == "tool_calls") {
                 if (tool_cb_ && !tc_id_.empty()) {
                     tool_cb_(tc_id_, tc_name_, tc_args_);
@@ -79,7 +80,8 @@ void SSEParser::process_line(const std::string& line) {
                 }
             }
         }
-    } catch (...) {
+    } catch (const std::exception& e) {
+        GW_LOG_WARN("SSEParser JSON parse failed: " + std::string(e.what()) + " payload=" + payload.substr(0,200));
         if (!payload.empty() && tok_cb_) {
             tok_cb_(payload);
         }

@@ -32,27 +32,27 @@
   },
   "backends": [
     {
-      "name": "llama-05b",
-      "url": "http://127.0.0.1:8300/v1/chat/completions",
+      "name": "ollama-qwen",
+      "url": "http://127.0.0.1:11434/v1/chat/completions",
       "api_key": "",
-      "model": "local-model",
+      "model": "qwen2.5:0.5b-instruct-q4_K_M",
       "weight": 1,
-      "route_model": "local-model"
+      "route_model": "qwen2.5:0.5b-instruct-q4_K_M"
     },
     {
-      "name": "llama-7b",
-      "url": "http://127.0.0.1:8200/v1/chat/completions",
+      "name": "ollama-fallback",
+      "url": "http://127.0.0.1:11434/v1/chat/completions",
       "api_key": "",
-      "model": "big-model",
+      "model": "qwen2.5:0.5b-instruct-q4_K_M",
       "weight": 1,
-      "route_model": "big-model"
+      "route_model": "*"
     }
   ],
   "api_keys": [
     {
       "key": "test-key-123",
       "models": "*",
-      "qps": 60,
+      "qps": 10000,
       "enabled": true
     }
   ]

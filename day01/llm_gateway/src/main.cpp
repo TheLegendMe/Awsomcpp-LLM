@@ -8,6 +8,7 @@
 #include "remote_upstream.h"
 #include "logger.h"
 #include "metrics.h"
+#include "agent_cache.h"
 #include "plugin_types.h"
 #include "ws_chat_controller.h"
 #include <drogon/drogon.h>
@@ -83,13 +84,13 @@ static void handle_chat(
         std::move(callback)(r); return;
     }
 
-    std::string nurl = node->url, nkey = node->api_key;
+    std::string nurl = node->url, nkey = node->api_key, nmodel = node->model;
     auto async_resp = drogon::HttpResponse::newAsyncStreamResponse(
         [=](drogon::ResponseStreamPtr stream) mutable {
         ensure_thread_pool();  // 上游 I/O 线程也需要 VM 池
         auto s = std::make_shared<drogon::ResponseStreamPtr>(std::move(stream));
         gw::LLMRequest lr;
-        lr.model=model; lr.messages_json=messages_json;
+        lr.model = nmodel.empty() ? model : nmodel; lr.messages_json=messages_json;
         lr.temperature=temp; lr.max_tokens=max_tok;
 
         lr.on_token = [s](const std::string& tok) {
@@ -175,9 +176,10 @@ int main(int argc, char* argv[]) {
         drogon::app().addListener("0.0.0.0",8080); drogon::app().setThreadNum(4);
     }
     load_config(cp);
+    gw::CacheCoordinator::instance().init("data/l2_cache", "data/l3_archive");
     gw::PluginManager::instance().start_hot_reload();
-    gw::BackendNode ln; ln.name="llama-local"; ln.url="http://127.0.0.1:8100/v1/chat/completions";
-    ln.model="local-model"; ln.weight=1;
+    gw::BackendNode ln; ln.name="ollama-local"; ln.url="http://127.0.0.1:11434/v1/chat/completions";
+    ln.model="qwen2.5:7b-instruct-q4_K_M"; ln.weight=1;
     if (!gw::Router::instance().route("local-model")) {
         gw::Router::instance().register_node("local-model",ln);
         gw::Router::instance().register_node("*",ln);
@@ -192,5 +194,7 @@ int main(int argc, char* argv[]) {
     drogon::app().registerHandler("/plugins", +handle_plugins, {drogon::Get});
     fprintf(stderr,"LLM Gateway (Drogon) on :8080\n");
     drogon::app().run();
-    gw::PluginManager::instance().shutdown(); Logger::instance().shutdown(); return 0;
+    gw::PluginManager::instance().shutdown();
+    gw::CacheCoordinator::instance().shutdown();
+    Logger::instance().shutdown(); return 0;
 }

@@ -28,7 +28,7 @@ function on_request(ctx)
             local found_pos = string.find(lower, kw, 1, true)
             gateway.log("DEBUG", "  search '" .. kw .. "' -> " .. tostring(found_pos))
             if found_pos then
-                ctx:set_response(403,
+                ctx.set_response(403,
                     '{"error":"content blocked","reason":"sensitive keyword: ' .. kw .. '"}')
                 return "ABORT_EARLY"
             end

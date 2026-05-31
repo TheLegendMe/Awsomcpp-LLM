@@ -227,7 +227,7 @@ PluginManager::run_request_pipeline(const PluginContext& ctx) {
             lua_ctx["api_key"]       = result.ctx.api_key;
             lua_ctx["request_id"]    = result.ctx.request_id;
 
-            // set_response 方法
+            // set_response(status, body) — return ABORT_EARLY afterwards
             lua_ctx.set_function("set_response",
                 [&result](int status, const std::string& body) {
                     result.passed       = false;
@@ -235,7 +235,7 @@ PluginManager::run_request_pipeline(const PluginContext& ctx) {
                     result.abort_body   = body;
                 });
 
-            // contains_sensitive
+            // contains_sensitive() -> bool
             lua_ctx.set_function("contains_sensitive",
                 [&lua_ctx]() -> bool {
                     std::string msgs = lua_ctx.get_or("messages_json", std::string(""));

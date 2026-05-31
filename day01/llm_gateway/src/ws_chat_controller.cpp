@@ -2,6 +2,7 @@
  * ws_chat_controller.cpp — WebSocket 聊天控制器实现
  *   客户端长连接，线程安全的 upstream → WebSocket 桥接
  *   upstream I/O 线程 → EventLoop::queueInLoop → conn->send()
+ *   支持: user / executor / agent 三种角色
  */
 #include "ws_chat_controller.h"
 #include "plugin_manager.h"
@@ -11,9 +12,11 @@
 #include "metrics.h"
 #include "logger.h"
 #include "i_upstream.h"
+#include "agent_cache.h"
 #include <trantor/net/EventLoop.h>
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <openssl/evp.h>
 
 using json = nlohmann::json;
 
@@ -27,17 +30,23 @@ static void ensure_thread_pool() {
         PluginManager::instance().setup_thread_pool();
 }
 
-// ─── 连接上下文 ──────────────────────────────────────────────────────
-struct SessionCtx {
-    std::string          session_id;
-    std::string          api_key;
-    std::string          client_ip;
-    std::string          role = "user";   // "user" 或 "executor"
-    bool                 authenticated = false;
-    trantor::EventLoop*  loop = nullptr;
-    std::vector<std::string> tools;       // executor 能执行的工具名
-    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> active_requests;
-};
+// ─── 简单 SHA256 ─────────────────────────────────────────────────────
+static std::string sha256(const std::string& input) {
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
+    EVP_DigestUpdate(ctx, input.c_str(), input.size());
+    EVP_DigestFinal_ex(ctx, hash, &len);
+    EVP_MD_CTX_free(ctx);
+    std::string hex;
+    for (unsigned int i = 0; i < len; ++i) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", hash[i]);
+        hex += buf;
+    }
+    return hex;
+}
 
 // ─── 线程安全的 WebSocket 发送 ──────────────────────────────────────
 void WsChatController::ws_send(const drogon::WebSocketConnectionPtr& conn,
@@ -46,6 +55,17 @@ void WsChatController::ws_send(const drogon::WebSocketConnectionPtr& conn,
     ctx->loop->queueInLoop([conn, msg]() {
         if (conn->connected()) conn->send(msg);
     });
+}
+
+void WsChatController::ws_send_to_session(const std::string& session_id,
+                                           const std::string& msg) {
+    drogon::WebSocketConnectionPtr conn;
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        auto it = sessions_.find(session_id);
+        if (it != sessions_.end()) conn = it->second;
+    }
+    if (conn) ws_send(conn, msg);
 }
 
 // ─── 连接建立 ───────────────────────────────────────────────────────
@@ -71,6 +91,9 @@ void WsChatController::handleNewConnection(
             ctx->api_key = ah.substr(7);
     }
 
+    auto role_param = req->getParameter("role");
+    if (!role_param.empty()) ctx->role = role_param;
+
     // 鉴权
     std::string err = AuthManager::instance().verify(ctx->api_key, "*");
     if (!err.empty()) {
@@ -89,10 +112,17 @@ void WsChatController::handleNewConnection(
 
     conn->setContext(ctx);
 
-    // 服务端 WebSocket 协议级心跳：每 30s 发 ping，客户端应自动回 pong
+    // 注册到 session map
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        sessions_[ctx->session_id] = conn;
+    }
+
+    // 服务端 WebSocket 协议级心跳：每 30s 发 ping
     conn->setPingMessage("", std::chrono::seconds(30));
 
-    GW_LOG_INFO("[" + ctx->client_ip + "] WS connected session=" + ctx->session_id);
+    GW_LOG_INFO("[" + ctx->client_ip + "] WS connected session=" + ctx->session_id +
+                " role=" + ctx->role);
 
     conn->send(json{{"type","connected"},{"session_id",ctx->session_id}}.dump());
 }
@@ -145,21 +175,18 @@ void WsChatController::handleNewMessage(
         std::string role = msg.value("role", "");
         if (role == "executor") {
             ctx->role = "executor";
-            // 注册工具能力
             if (msg.contains("tools") && msg["tools"].is_array()) {
                 for (auto& t : msg["tools"]) {
                     std::string name = t.value("name", t.is_string() ? t.get<std::string>() : "");
                     if (!name.empty()) {
                         ctx->tools.push_back(name);
                         std::string desc = t.value("description", "");
-                        // 自动转完整 JSON Schema：{"key":"type"} → {"type":"object","properties":{...}}
                         std::string params = "{}";
                         if (t.contains("parameters") && t["parameters"].is_object()) {
                             auto& p = t["parameters"];
                             if (p.contains("type")) {
-                                params = p.dump();  // 已是完整 schema
+                                params = p.dump();
                             } else {
-                                // 简化格式，自动包装
                                 json schema = {{"type","object"}};
                                 json props = json::object();
                                 for (auto& [k, v] : p.items()) {
@@ -183,8 +210,50 @@ void WsChatController::handleNewMessage(
             auto resp = json{{"type","registered"},{"role","executor"}};
             resp["tools"] = ToolRegistry::instance().names();
             conn->send(resp.dump());
-            GW_LOG_INFO("[" + ctx->client_ip + "] executor registered session=" + ctx->session_id +
-                        " tools=" + std::to_string(ctx->tools.size()));
+            GW_LOG_INFO("[" + ctx->client_ip + "] executor registered session=" +
+                        ctx->session_id + " tools=" + std::to_string(ctx->tools.size()));
+
+        } else if (role == "agent") {
+            // ── Agent 注册 ──
+            ctx->role = "agent";
+            ctx->agent_name = msg.value("agent_name", "agent-" + ctx->session_id);
+
+            if (msg.contains("capabilities") && msg["capabilities"].is_array()) {
+                for (auto& cap : msg["capabilities"]) {
+                    AgentCapability ac;
+                    ac.name = cap.value("name", "");
+                    ac.description = cap.value("description", "");
+                    ac.input_schema_json = cap.value("input_schema", "{}");
+                    ac.output_schema_json = cap.value("output_schema", "{}");
+                    if (cap.contains("weight")) ac.weight = cap["weight"].get<int>();
+                    if (!ac.name.empty()) ctx->capabilities.push_back(ac);
+                }
+            }
+
+            AgentRecord record;
+            record.session_id = ctx->session_id;
+            record.agent_name = ctx->agent_name;
+            record.capabilities = ctx->capabilities;
+            record.peer_addr = ctx->client_ip;
+            record.registered_at_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            record.last_heartbeat_ms = record.registered_at_ms;
+
+            AgentRegistry::instance().register_agent(ctx->session_id, record);
+
+            json resp = {{"type","registered"},{"role","agent"},
+                         {"agent_name", ctx->agent_name}};
+            json caps = json::array();
+            for (auto& c : ctx->capabilities) {
+                caps.push_back({{"name", c.name}, {"description", c.description}});
+            }
+            resp["capabilities"] = caps;
+            resp["all_caps"] = AgentRegistry::instance().all_capabilities().size();
+            conn->send(resp.dump());
+            GW_LOG_INFO("[" + ctx->client_ip + "] agent registered: " + ctx->agent_name +
+                       " session=" + ctx->session_id +
+                       " caps=" + std::to_string(ctx->capabilities.size()));
         }
 
     } else if (msg_type == "tool_call") {
@@ -196,8 +265,44 @@ void WsChatController::handleNewMessage(
     } else if (msg_type == "tool_result") {
         std::string call_id  = msg.value("call_id", "");
         std::string content  = msg.value("content", "");
-        GW_LOG_DEBUG("[" + ctx->client_ip + "] tool_result req=" + request_id + " call=" + call_id);
+        GW_LOG_DEBUG("[" + ctx->client_ip + "] tool_result req=" + request_id +
+                    " call=" + call_id);
         route_tool_result(conn, request_id, call_id, content);
+
+    // ─── Agent 间消息 (新增) ──────────────────────────────────────
+    } else if (msg_type == "agent_call") {
+        std::string call_id = msg.value("call_id", "acall-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::string target_agent = msg.value("target_agent", "");
+        std::string capability   = msg.value("capability", "");
+        std::string input        = msg.value("input", msg.contains("payload")
+                                            ? msg["payload"].dump() : "{}");
+        bool bypass_cache = msg.value("bypass_cache", false);
+
+        route_agent_call(conn, call_id, target_agent, capability, input,
+                        ctx->session_id, bypass_cache);
+
+    } else if (msg_type == "agent_result") {
+        std::string call_id  = msg.value("call_id", "");
+        std::string output   = msg.value("output", msg.contains("payload")
+                                     ? msg["payload"].dump() : "{}");
+        double confidence    = msg.value("confidence", 0.8);
+
+        route_agent_result(conn, call_id, output, confidence);
+
+    } else if (msg_type == "cache_invalidate") {
+        std::string key = msg.value("key", "");
+        std::string reason = msg.value("reason", "");
+        bool cascade = msg.value("cascade", true);
+
+        handle_cache_invalidate(conn, key, reason, cascade);
+
+    } else if (msg_type == "context_expand") {
+        std::string call_id = msg.value("call_id", "");
+        std::string ref     = msg.value("ref", "");
+        size_t max_tok = msg.value("max_tokens", 4096);
+
+        handle_context_expand(conn, call_id, ref, max_tok);
     }
 }
 
@@ -216,7 +321,6 @@ void WsChatController::process_chat(
     auto ctx = conn->getContext<SessionCtx>();
     if (!ctx) return;
 
-    // 鉴权
     std::string auth_err = AuthManager::instance().verify(ctx->api_key, model);
     if (!auth_err.empty()) {
         METRIC_INC(auth_failed);
@@ -225,7 +329,6 @@ void WsChatController::process_chat(
         return;
     }
 
-    // 路由
     BackendNode* node = Router::instance().route(model);
     if (!node) {
         conn->send(json{{"type","error"},{"request_id",request_id},
@@ -233,7 +336,6 @@ void WsChatController::process_chat(
         return;
     }
 
-    // 插件管道
     PluginContext pctx;
     pctx.model         = model;
     pctx.messages_json = messages_json;
@@ -256,7 +358,6 @@ void WsChatController::process_chat(
         return;
     }
 
-    // 创建取消标记
     auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
     ctx->active_requests[request_id] = cancel_flag;
 
@@ -264,34 +365,28 @@ void WsChatController::process_chat(
     std::string node_key  = node->api_key;
     auto        loop      = ctx->loop;
 
-    // 如果没有显式传 tools，自动注入全局注册的工具
     std::string final_tools = tools_json;
     if (final_tools.empty()) {
         final_tools = ToolRegistry::instance().tools_json();
     }
 
-    // 构建 LLMRequest，回调中通过 ws_send 安全写回 WebSocket
     LLMRequest llm_req;
-    llm_req.model         = final_model;
+    llm_req.model         = node->model.empty() ? final_model : node->model;
     llm_req.messages_json = final_messages;
     llm_req.tools_json    = final_tools;
     llm_req.temperature   = final_temp;
     llm_req.max_tokens    = final_max_tok;
 
-    // 延迟统计
     auto req_start  = std::chrono::steady_clock::now();
     auto first_tok  = std::make_shared<std::atomic<bool>>(false);
 
     llm_req.on_tool_call = [conn, request_id, loop, this](const std::string& call_id,
                                                             const std::string& name,
                                                             const std::string& arguments) {
-        // 从上游 I/O 线程回调，dispatch 到 conn 的事件循环
         loop->queueInLoop([conn, request_id, call_id, name, arguments, this]() {
-            // 推送给客户端
             conn->send(json{{"type","tool_call"},{"request_id",request_id},
                            {"call_id",call_id},{"name",name},
                            {"arguments",json::parse(arguments)}}.dump());
-            // 路由到 executor
             route_tool_call(conn, request_id, call_id, name, arguments);
         });
     };
@@ -299,7 +394,6 @@ void WsChatController::process_chat(
     llm_req.on_token = [conn, request_id, cancel_flag, req_start, first_tok](const std::string& tok) {
         ensure_thread_pool();
         if (cancel_flag->load()) return;
-        // 首 token 延迟
         if (!first_tok->exchange(true)) {
             auto now = std::chrono::steady_clock::now();
             auto us  = std::chrono::duration_cast<std::chrono::microseconds>(now - req_start).count();
@@ -325,7 +419,6 @@ void WsChatController::process_chat(
         ws_send(conn, json{{"type","done"},{"request_id",request_id}}.dump());
         METRIC_INC(success_count);
         METRIC_DEC(active_requests);
-        // 清理取消标记（必须在连接的事件循环中操作 active_requests）
         loop->queueInLoop([conn, request_id]() {
             auto ctx = conn->getContext<SessionCtx>();
             if (ctx) ctx->active_requests.erase(request_id);
@@ -355,7 +448,7 @@ void WsChatController::process_chat(
     g_upstream->submit(llm_req, node_url, node_key);
 }
 
-// ─── 路由 tool_call 到 executor ────────────────────────────────────
+// ─── 路由 tool_call ─────────────────────────────────────────────────
 void WsChatController::route_tool_call(
     const drogon::WebSocketConnectionPtr& sender,
     const std::string& request_id,
@@ -366,13 +459,11 @@ void WsChatController::route_tool_call(
     drogon::WebSocketConnectionPtr executor;
     {
         std::lock_guard<std::mutex> lk(exec_mu_);
-        // 清理已断开的 executor
         executors_.erase(
             std::remove_if(executors_.begin(), executors_.end(),
                 [](const auto& c) { return !c || c->disconnected(); }),
             executors_.end());
 
-        // 优先按能力匹配
         std::vector<drogon::WebSocketConnectionPtr> capable;
         for (auto& e : executors_) {
             auto ectx = e->getContext<SessionCtx>();
@@ -386,14 +477,13 @@ void WsChatController::route_tool_call(
 
         if (pool.empty()) {
             ws_send(sender, json{{"type","error"},{"request_id",request_id},
-                                {"code","no_executor"},{"message","no executor available"}}.dump());
+                                {"code","no_executor"}}.dump());
             return;
         }
         exec_rr_idx_ = (exec_rr_idx_ + 1) % pool.size();
         executor = pool[exec_rr_idx_];
     }
 
-    // 记录 sender → pending，用于 tool_result 回传
     std::string key = request_id + ":" + call_id;
     {
         std::lock_guard<std::mutex> lk(pending_mu_);
@@ -413,7 +503,6 @@ void WsChatController::route_tool_call(
     }.dump());
 }
 
-// ─── 路由 tool_result 回原始客户端 ──────────────────────────────────
 void WsChatController::route_tool_result(
     const drogon::WebSocketConnectionPtr& executor,
     const std::string& request_id,
@@ -426,13 +515,12 @@ void WsChatController::route_tool_result(
         std::lock_guard<std::mutex> lk(pending_mu_);
         auto it = pending_tools_.find(key);
         if (it == pending_tools_.end()) {
-            // 列出当前所有 pending key 辅助排查
             std::string keys;
             for (auto& [k, v] : pending_tools_) keys += k + " ";
             GW_LOG_WARN("tool_result no match: key='" + key +
                         "' pending=[" + keys + "]");
             executor->send(json{{"type","error"},{"request_id",request_id},
-                               {"code","no_pending"},{"message","no pending tool call for this key"}}.dump());
+                               {"code","no_pending"}}.dump());
             return;
         }
         target = it->second;
@@ -441,7 +529,7 @@ void WsChatController::route_tool_result(
 
     if (!target || target->disconnected()) {
         executor->send(json{{"type","error"},{"request_id",request_id},
-                           {"code","client_gone"},{"message","original client disconnected"}}.dump());
+                           {"code","client_gone"}}.dump());
         return;
     }
 
@@ -457,6 +545,238 @@ void WsChatController::route_tool_result(
     }.dump());
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Agent 间调用 (新增)
+// ═══════════════════════════════════════════════════════════════════════
+
+void WsChatController::route_agent_call(
+    const drogon::WebSocketConnectionPtr& caller,
+    const std::string& call_id,
+    const std::string& target_agent_id,
+    const std::string& capability,
+    const std::string& input_payload,
+    const std::string& session_id,
+    bool bypass_cache)
+{
+    auto caller_ctx = caller->getContext<SessionCtx>();
+
+    // 1. 查询缓存 (除非显示跳过)
+    if (!bypass_cache) {
+        std::string input_hash = sha256(input_payload);
+        auto cached = CacheCoordinator::instance().query(
+            target_agent_id.empty() ? "any" : target_agent_id,
+            capability, input_hash, session_id);
+
+        if (cached.hit) {
+            // 命中 → 直接返回
+            ws_send(caller, json{
+                {"type", "agent_result"},
+                {"call_id", call_id},
+                {"agent_id", cached.entry.agent_id},
+                {"output", cached.entry.output_summary},
+                {"confidence", cached.entry.confidence},
+                {"cache_status", cached.stale ? "stale" : "fresh"},
+                {"cache_layer", static_cast<int>(cached.layer)},
+                {"context_ref", cached.entry.full_ref}
+            }.dump());
+
+            // 追加到会话缓冲区
+            SessionTurn turn;
+            turn.call_id = call_id;
+            turn.agent_id = cached.entry.agent_id;
+            turn.capability = capability;
+            turn.input_summary = input_payload.substr(0, 200);
+            turn.output_summary = cached.entry.output_summary;
+            turn.cache_key = cached.entry.key;
+            turn.confidence = cached.entry.confidence;
+            turn.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            auto& sb = CacheCoordinator::instance().session_buffer(session_id);
+            sb.append(turn);
+
+            if (cached.stale) {
+                GW_LOG_INFO("[" + (caller_ctx ? caller_ctx->client_ip : "?") +
+                           "] agent_call cache HIT (stale) call=" + call_id +
+                           " cap=" + capability + " confidence=" +
+                           std::to_string(cached.entry.confidence));
+            }
+            return;
+        }
+    }
+
+    // 2. 路由到目标 Agent
+    std::optional<AgentRecord> target;
+    if (!target_agent_id.empty()) {
+        target = AgentRegistry::instance().find(target_agent_id);
+    }
+    if (!target) {
+        target = AgentRegistry::instance().route(capability);
+    }
+
+    if (!target) {
+        ws_send(caller, json{
+            {"type", "error"},
+            {"call_id", call_id},
+            {"code", "no_agent"},
+            {"message", "no agent available for capability: " + capability}
+        }.dump());
+        GW_LOG_WARN("[" + (caller_ctx ? caller_ctx->client_ip : "?") +
+                   "] agent_call no agent for cap=" + capability);
+        return;
+    }
+
+    // 3. 记录 pending 映射
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        pending_agents_[call_id] = caller;
+    }
+
+    // 4. 转发给 callee
+    ws_send_to_session(target->session_id, json{
+        {"type", "agent_call"},
+        {"call_id", call_id},
+        {"caller_session", session_id},
+        {"capability", capability},
+        {"input", json::parse(input_payload.empty() ? "{}" : input_payload)},
+        {"timeout_ms", 30000}
+    }.dump());
+
+    GW_LOG_INFO("[" + (caller_ctx ? caller_ctx->client_ip : "?") +
+               "] agent_call → " + target->agent_name +
+               " call=" + call_id + " cap=" + capability);
+}
+
+void WsChatController::route_agent_result(
+    const drogon::WebSocketConnectionPtr& callee,
+    const std::string& call_id,
+    const std::string& output_payload,
+    double confidence)
+{
+    auto callee_ctx = callee->getContext<SessionCtx>();
+
+    // 查找调用方
+    drogon::WebSocketConnectionPtr caller;
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        auto it = pending_agents_.find(call_id);
+        if (it == pending_agents_.end()) {
+            GW_LOG_WARN("agent_result no pending: call_id=" + call_id);
+            ws_send(callee, json{
+                {"type", "error"},
+                {"call_id", call_id},
+                {"code", "no_pending"},
+                {"message", "no pending agent call for this call_id"}
+            }.dump());
+            return;
+        }
+        caller = it->second;
+        pending_agents_.erase(it);
+    }
+
+    if (!caller || caller->disconnected()) {
+        ws_send(callee, json{
+            {"type", "error"},
+            {"call_id", call_id},
+            {"code", "caller_gone"}
+        }.dump());
+        return;
+    }
+
+    auto caller_ctx = caller->getContext<SessionCtx>();
+
+    // 写缓存
+    CacheEntry entry;
+    entry.key = "agent:" + (callee_ctx ? callee_ctx->agent_name : "unknown") +
+                ":agent_call:" + sha256(output_payload);
+    entry.agent_id = callee_ctx ? callee_ctx->session_id : "";
+    entry.capability = "agent_call";
+    entry.input_hash = call_id;
+    entry.output = output_payload;
+    entry.output_summary = output_payload.substr(0, 200);
+    entry.confidence = confidence;
+    entry.confidence_decay = 0.02;
+    entry.base_ttl_seconds = 600;
+    entry.status = confidence > 0.3 ? CacheStatus::FRESH : CacheStatus::STALE;
+    CacheCoordinator::instance().write(entry);
+
+    // 追加到调用方会话缓冲区
+    if (caller_ctx) {
+        SessionTurn turn;
+        turn.call_id = call_id;
+        turn.agent_id = callee_ctx ? callee_ctx->agent_name : "";
+        turn.capability = "agent_call";
+        turn.input_summary = "";
+        turn.output_summary = output_payload.substr(0, 200);
+        turn.cache_key = entry.key;
+        turn.confidence = confidence;
+        turn.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        auto& sb = CacheCoordinator::instance().session_buffer(caller_ctx->session_id);
+        sb.append(turn);
+    }
+
+    // 回传结果
+    ws_send(caller, json{
+        {"type", "agent_result"},
+        {"call_id", call_id},
+        {"agent_id", callee_ctx ? callee_ctx->agent_name : ""},
+        {"output", json::parse(output_payload.empty() ? "{}" : output_payload)},
+        {"confidence", confidence},
+        {"cache_status", "fresh"},
+        {"context_ref", entry.full_ref}
+    }.dump());
+
+    GW_LOG_INFO("[" + (callee_ctx ? callee_ctx->client_ip : "?") +
+               "] agent_result → caller call=" + call_id +
+               " confidence=" + std::to_string(confidence));
+}
+
+void WsChatController::handle_cache_invalidate(
+    const drogon::WebSocketConnectionPtr& sender,
+    const std::string& key,
+    const std::string& reason,
+    bool cascade)
+{
+    auto ctx = sender->getContext<SessionCtx>();
+    GW_LOG_WARN("[" + (ctx ? ctx->client_ip : "?") +
+               "] cache_invalidate key=" + key + " reason=" + reason +
+               " cascade=" + (cascade ? "true" : "false"));
+
+    CacheCoordinator::instance().invalidate(key, reason, cascade);
+
+    ws_send(sender, json{
+        {"type", "cache_invalidated"},
+        {"key", key},
+        {"cascade", cascade}
+    }.dump());
+}
+
+void WsChatController::handle_context_expand(
+    const drogon::WebSocketConnectionPtr& requester,
+    const std::string& call_id,
+    const std::string& ref,
+    size_t max_tokens)
+{
+    auto expanded = CacheCoordinator::instance().expand_context(ref, max_tokens);
+    if (expanded) {
+        ws_send(requester, json{
+            {"type", "context_expand_result"},
+            {"call_id", call_id},
+            {"ref", ref},
+            {"full_text", expanded->full_text},
+            {"total_tokens", expanded->total_tokens},
+            {"truncated", expanded->truncated}
+        }.dump());
+    } else {
+        ws_send(requester, json{
+            {"type", "error"},
+            {"call_id", call_id},
+            {"code", "not_found"},
+            {"message", "context ref not found: " + ref}
+        }.dump());
+    }
+}
+
 // ─── 连接关闭 ───────────────────────────────────────────────────────
 void WsChatController::handleConnectionClosed(
     const drogon::WebSocketConnectionPtr& conn)
@@ -469,13 +789,26 @@ void WsChatController::handleConnectionClosed(
         flag->store(true);
     }
 
-    // 从 executor 池移除，清理注册的工具
+    // 从 executor 池移除
     if (ctx->role == "executor") {
         ToolRegistry::instance().remove_source(ctx->session_id);
         std::lock_guard<std::mutex> lk(exec_mu_);
         executors_.erase(
             std::remove(executors_.begin(), executors_.end(), conn),
             executors_.end());
+    }
+
+    // Agent 注销
+    if (ctx->role == "agent") {
+        AgentRegistry::instance().unregister_agent(ctx->session_id);
+        // 归档会话
+        CacheCoordinator::instance().archive_session(ctx->session_id);
+    }
+
+    // 从 session map 移除
+    {
+        std::lock_guard<std::mutex> lk(session_mu_);
+        sessions_.erase(ctx->session_id);
     }
 
     GW_LOG_INFO("[" + ctx->client_ip + "] WS disconnected session=" + ctx->session_id +
