@@ -39,7 +39,7 @@ if echo "$HEALTH" | grep -q '"ok"'; then
     echo -e "${GREEN}OK${NC}"
 else
     echo -e "${RED}DOWN${NC}"
-    echo "Gateway not reachable. Start from day01/llm_gateway/:"
+    echo "Gateway not reachable. Start from src/llm_gateway/:"
     echo "  ./build/llm_gateway conf/gateway.json"
     exit 1
 fi
