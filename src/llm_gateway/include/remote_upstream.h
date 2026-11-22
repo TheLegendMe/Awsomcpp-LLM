@@ -57,6 +57,8 @@ struct TransferCtx {
     std::unique_ptr<SSEParser>               parser;
     std::function<void(const std::string&)>  err_cb;
     curl_slist*                              hdrs = nullptr;
+    std::shared_ptr<std::atomic<bool>>       cancel_flag;
+    bool                                     cancelled = false;
 
     ~TransferCtx() { if (hdrs) curl_slist_free_all(hdrs); }
 };
@@ -92,6 +94,7 @@ private:
     void drain_queue();
     void add_transfer(PendingTask task);
     void reap_finished();
+    void reap_cancelled();
 
     static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* ud);
 };

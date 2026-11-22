@@ -79,7 +79,9 @@ add_executable(llm_gateway
     src/lua_vm_pool.cpp
     src/remote_upstream.cpp
     src/ws_chat_controller.cpp
+    src/agent_runner.cpp
     src/agent_cache.cpp
+    src/semantic_cache.cpp
 )
 
 target_include_directories(llm_gateway PRIVATE

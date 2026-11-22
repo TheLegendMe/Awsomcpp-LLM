@@ -85,30 +85,39 @@ static void handle_chat(
     }
 
     std::string nurl = node->url, nkey = node->api_key, nmodel = node->model;
+    auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
     auto async_resp = drogon::HttpResponse::newAsyncStreamResponse(
         [=](drogon::ResponseStreamPtr stream) mutable {
-        ensure_thread_pool();  // 上游 I/O 线程也需要 VM 池
+        ensure_thread_pool();
         auto s = std::make_shared<drogon::ResponseStreamPtr>(std::move(stream));
         gw::LLMRequest lr;
         lr.model = nmodel.empty() ? model : nmodel; lr.messages_json=messages_json;
         lr.temperature=temp; lr.max_tokens=max_tok;
+        lr.cancel_flag = cancel_flag;
 
-        lr.on_token = [s](const std::string& tok) {
+        auto full_response = std::make_shared<std::string>();
+        lr.on_token = [s, cancel_flag, full_response](const std::string& tok) {
+            if (cancel_flag->load()) return;
             ensure_thread_pool();
             auto p = gw::PluginManager::instance().run_token_pipeline(tok);
             if (!p.empty()) {
+                *full_response += p;
                 json c={{"object","chat.completion.chunk"},{"model","gateway"},
                     {"choices",json::array({{{"index",0},{"delta",{{"content",p}}},{"finish_reason",nullptr}}})}};
-                (*s)->send("data: "+c.dump()+"\n\n");
+                if (!(*s)->send("data: "+c.dump()+"\n\n")) {
+                    cancel_flag->store(true);
+                }
             }
         };
-        lr.on_done = [s]() {
+        lr.on_done = [s, cancel_flag, full_response]() {
+            if (cancel_flag->load()) return;
             ensure_thread_pool();
-            gw::PluginManager::instance().run_done_pipeline();
+            gw::PluginManager::instance().run_done_pipeline(*full_response);
             (*s)->send("data: [DONE]\n\n"); (*s)->close();
             METRIC_INC(success_count); METRIC_DEC(active_requests);
         };
-        lr.on_error = [s](const std::string& err) {
+        lr.on_error = [s, cancel_flag](const std::string& err) {
+            if (cancel_flag->load()) return;
             json e={{"error",err}}; (*s)->send("data: "+e.dump()+"\n\n"); (*s)->close();
             METRIC_INC(errors); METRIC_DEC(active_requests);
         };

@@ -318,7 +318,7 @@ std::string PluginManager::run_token_pipeline(const std::string& token) {
 }
 
 // ─── 执行 Done Pipeline ────────────────────────────────────────────
-void PluginManager::run_done_pipeline() {
+void PluginManager::run_done_pipeline(const std::string& response_text) {
     std::vector<PluginRuntime> plugins_snapshot;
     {
         std::lock_guard<std::mutex> lk(plugins_mu_);
@@ -337,7 +337,14 @@ void PluginManager::run_done_pipeline() {
 
             auto on_done = lua.globals().get_fn("on_done");
             if (on_done.get_type() == sol::type::function) {
-                on_done();
+                if (response_text.empty()) {
+                    on_done();
+                } else {
+                    // 包装为 table: {text = response_text}
+                    sol::table args = sol::table::create(lua.lua_state());
+                    args["text"] = response_text;
+                    on_done(args);
+                }
             }
         } catch (...) {}
     }

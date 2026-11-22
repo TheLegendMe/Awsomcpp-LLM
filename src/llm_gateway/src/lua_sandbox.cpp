@@ -3,7 +3,10 @@
  */
 #include "lua_sandbox.h"
 #include "common.h"
+#include "semantic_cache.h"
 #include <sol/sol.hpp>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
 namespace gw {
 
@@ -128,6 +131,69 @@ void LuaSandbox::inject_api(sol::state& lua, const GatewayAPI& api) {
     gw.set_function("cache_size", []() -> size_t {
         return CacheStore::instance().size();
     });
+
+    // --- 内部: 调用 Ollama embedding API ---
+    static const auto kEmbedUrl = std::string("http://127.0.0.1:11434/api/embeddings");
+
+    auto call_embed = [](const std::string& text) -> std::vector<float> {
+        CURL* curl = curl_easy_init();
+        if (!curl) return {};
+
+        nlohmann::json req = {{"model","nomic-embed-text"},{"prompt",text}};
+        std::string body = req.dump();
+        std::string resp;
+
+        struct curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_URL, kEmbedUrl.c_str());
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+            +[](char* p, size_t s, size_t n, void* u) -> size_t {
+                ((std::string*)u)->append(p, s*n); return s*n; });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+        CURLcode rc = curl_easy_perform(curl);
+        curl_slist_free_all(hdrs);
+        curl_easy_cleanup(curl);
+        if (rc != CURLE_OK) return {};
+
+        try {
+            auto j = nlohmann::json::parse(resp);
+            std::vector<float> emb;
+            for (auto& v : j["embedding"]) emb.push_back(v.get<float>());
+            return emb;
+        } catch (...) { return {}; }
+    };
+
+    // gateway.semantic_search(text, threshold) -> response or empty string
+    gw.set_function("semantic_search",
+        [call_embed](const std::string& text, float threshold) -> std::string {
+            auto emb = call_embed(text);
+            if (emb.empty()) return "";
+            auto [resp, sim] = SemanticCache::instance().search(emb, threshold);
+            return resp;  // empty on miss
+        });
+
+    // gateway.semantic_store(text, response) -> bool
+    gw.set_function("semantic_store",
+        [call_embed](const std::string& text, const std::string& response) -> bool {
+            auto emb = call_embed(text);
+            if (emb.empty()) return false;
+            SemanticCache::instance().store(emb, text, response);
+            return true;
+        });
+
+    // gateway.semantic_size() -> int
+    gw.set_function("semantic_size", []() -> size_t {
+        return SemanticCache::instance().size();
+    });
+
+    // gateway.json_parse(text) -> Lua table (as JSON string for Lua, processed by Lua)
+    // 由于 sol2 限制，用 pcall+json_parse 在 Lua 侧做
 }
 
 } // namespace gw

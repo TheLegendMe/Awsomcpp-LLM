@@ -87,8 +87,8 @@ public:
     // 返回: 经过所有插件处理后的 token（可能为空，表示被抑制）
     std::string run_token_pipeline(const std::string& token);
 
-    // 执行所有插件的 on_done hook
-    void run_done_pipeline();
+    // 执行所有插件的 on_done hook (response_text = LLM 完整回复)
+    void run_done_pipeline(const std::string& response_text = "");
 
     // ─── 信息 ──────────────────────────────────────────────────────
     std::vector<PluginInfo> list_plugins() const;

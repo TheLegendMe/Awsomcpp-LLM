@@ -30,6 +30,7 @@ struct LLMRequest {
                        const std::string& arguments)>  on_tool_call;
     std::function<void()>                              on_done;
     std::function<void(const std::string& err)>        on_error;
+    std::shared_ptr<std::atomic<bool>>                 cancel_flag;
 };
 
 struct RateLimitConfig {

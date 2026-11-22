@@ -73,6 +73,7 @@ docker run -p 8080:8080 llm-gateway
 | type | 说明 |
 |------|------|
 | `chat` | 发起对话 `{type, request_id, model, messages[], tools?}` |
+| `run` | 发起自主 Agent 循环 `{type, request_id, model, goal/messages[], tools?, max_steps?}` |
 | `tool_call` | 请求工具执行 `{type, request_id, call_id, name, arguments}` |
 | `tool_result` | 返回工具结果 `{type, request_id, call_id, content}` |
 | `register` | 注册 executor `{type, role:"executor", tools[...]}` |
@@ -84,10 +85,13 @@ docker run -p 8080:8080 llm-gateway
 | type | 说明 |
 |------|------|
 | `connected` | 鉴权通过 `{type, session_id}` |
+| `run_started` | 自主循环开始 `{type, request_id, max_steps}` |
+| `step` | 循环阶段 `{type, request_id, step, phase}` |
 | `token` | 流式增量 `{type, request_id, content}` |
 | `tool_call` | LLM 生成的工具调用 |
 | `tool_result` | 工具执行结果回传 |
 | `done` | 请求完成 |
+| `run_done` | 自主循环结束 `{type, request_id, steps, reason, content}` |
 | `error` | 错误 `{type, request_id, code, message}` |
 | `abort` | 插件拦截 |
 | `pong` | 心跳回复 |

@@ -137,6 +137,7 @@ void ChatController::chat(
     // 捕获需要的变量到 shared_ptr 以延长生命周期
     auto node_url = node->url;
     auto node_api_key = node->api_key;
+    auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
 
     auto async_resp = drogon::HttpResponse::newAsyncStreamResponse(
         [=](drogon::ResponseStreamPtr stream) mutable
@@ -147,8 +148,10 @@ void ChatController::chat(
         llm_req.messages_json = messages_json;
         llm_req.temperature   = temperature;
         llm_req.max_tokens    = max_tokens;
+        llm_req.cancel_flag   = cancel_flag;
 
-        llm_req.on_token = [stream, start_time](const std::string& tok) {
+        llm_req.on_token = [stream, start_time, cancel_flag](const std::string& tok) {
+            if (cancel_flag->load()) return;
             std::string processed =
                 PluginManager::instance().run_token_pipeline(tok);
             if (!processed.empty()) {
@@ -162,18 +165,21 @@ void ChatController::chat(
                     }})}
                 };
                 std::string frame = "data: " + chunk.dump() + "\n\n";
-                stream->send(frame);
+                if (!stream->send(frame)) {
+                    cancel_flag->store(true);
+                }
             }
         };
 
-        llm_req.on_done = [stream, client_ip, model, start_time]() {
+        llm_req.on_done = [stream, client_ip, model, start_time, cancel_flag, messages_json]() {
+            if (cancel_flag->load()) return;
             auto end = std::chrono::steady_clock::now();
             auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end - start_time);
             LOG_INFO("[" + client_ip + "] SUCCESS model=" + model +
                      " duration=" + std::to_string(dur.count()) + "ms");
 
-            PluginManager::instance().run_done_pipeline();
+            PluginManager::instance().run_done_pipeline("");
 
             stream->send("data: [DONE]\n\n");
             stream->close();
@@ -181,8 +187,9 @@ void ChatController::chat(
             METRIC_DEC(active_requests);
         };
 
-        llm_req.on_error = [stream, client_ip, model, start_time](
+        llm_req.on_error = [stream, client_ip, model, start_time, cancel_flag](
                                const std::string& err) {
+            if (cancel_flag->load()) return;
             auto end = std::chrono::steady_clock::now();
             auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end - start_time);

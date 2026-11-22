@@ -136,6 +136,7 @@ void RemoteUpstream::io_loop() {
         int running = 0;
         curl_multi_perform(multi_, &running);
         reap_finished();
+        reap_cancelled();
         curl_multi_poll(multi_, nullptr, 0, 200, nullptr);
     }
 }
@@ -176,9 +177,32 @@ void RemoteUpstream::add_transfer(PendingTask task) {
     }
 
     auto ctx = std::make_unique<TransferCtx>();
-    ctx->body   = body_json.dump();
-    ctx->err_cb = req.on_error;
-    ctx->parser = std::make_unique<SSEParser>(req.on_token, req.on_tool_call, req.on_done, req.on_error);
+    ctx->body        = body_json.dump();
+    ctx->cancel_flag = req.cancel_flag;  // 共享取消标记
+    ctx->err_cb      = req.on_error;
+
+    // 包装回调：执行前检查 cancel_flag 和 cancelled
+    auto done_wrap = [ctx_ptr = ctx.get(), orig_done = req.on_done]() {
+        if (ctx_ptr->cancel_flag && ctx_ptr->cancel_flag->load()) return;
+        if (orig_done) orig_done();
+    };
+    auto err_wrap = [ctx_ptr = ctx.get(), orig_err = req.on_error](const std::string& e) {
+        if (ctx_ptr->cancel_flag && ctx_ptr->cancel_flag->load()) return;
+        if (ctx_ptr->cancelled) return;
+        if (orig_err) orig_err(e);
+    };
+    auto tok_wrap = [ctx_ptr = ctx.get(), orig_tok = req.on_token](const std::string& tok) {
+        if (ctx_ptr->cancel_flag && ctx_ptr->cancel_flag->load()) return;
+        if (ctx_ptr->cancelled) return;
+        if (orig_tok) orig_tok(tok);
+    };
+    auto tool_wrap = [ctx_ptr = ctx.get(), orig_tool = req.on_tool_call](
+        const std::string& cid, const std::string& name, const std::string& args) {
+        if (ctx_ptr->cancel_flag && ctx_ptr->cancel_flag->load()) return;
+        if (ctx_ptr->cancelled) return;
+        if (orig_tool) orig_tool(cid, name, args);
+    };
+    ctx->parser = std::make_unique<SSEParser>(tok_wrap, tool_wrap, done_wrap, err_wrap);
 
     ctx->hdrs = curl_slist_append(ctx->hdrs, "Content-Type: application/json");
     if (!api_key.empty()) {
@@ -197,6 +221,8 @@ void RemoteUpstream::add_transfer(PendingTask task) {
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION,  write_cb);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA,      ctx->parser.get());
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, 60L);   // 60s 内速度低于下限视为卡死
+    curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT, 100L); // 下限 100 bytes/s
     curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(easy, CURLOPT_BUFFERSIZE,     1024L);
@@ -206,6 +232,28 @@ void RemoteUpstream::add_transfer(PendingTask task) {
 
     active_[easy] = std::move(ctx);
     curl_multi_add_handle(multi_, easy);
+}
+
+void RemoteUpstream::reap_cancelled() {
+    std::vector<CURL*> to_cancel;
+    for (auto& [easy, ctx] : active_) {
+        if (ctx->cancel_flag && ctx->cancel_flag->load()) {
+            to_cancel.push_back(easy);
+        }
+    }
+    for (CURL* easy : to_cancel) {
+        auto it = active_.find(easy);
+        if (it != active_.end()) {
+            it->second->cancelled = true;
+            METRIC_DEC(active_requests);
+            active_.erase(it);
+        }
+        curl_multi_remove_handle(multi_, easy);
+        curl_easy_cleanup(easy);
+    }
+    if (!to_cancel.empty()) {
+        GW_LOG_INFO("Cancelled " + std::to_string(to_cancel.size()) + " upstream transfers");
+    }
 }
 
 void RemoteUpstream::reap_finished() {
@@ -221,14 +269,19 @@ void RemoteUpstream::reap_finished() {
             long http_code = 0;
             curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
 
-            if (res != CURLE_OK) {
-                if (it->second->err_cb) it->second->err_cb(curl_easy_strerror(res));
-                METRIC_INC(errors);
-            } else if (http_code != 200) {
-                if (it->second->err_cb) it->second->err_cb("HTTP " + std::to_string(http_code));
-                METRIC_INC(errors);
-            } else {
-                METRIC_INC(success_count);
+            bool is_cancelled = it->second->cancelled ||
+                (it->second->cancel_flag && it->second->cancel_flag->load());
+
+            if (!is_cancelled) {
+                if (res != CURLE_OK) {
+                    if (it->second->err_cb) it->second->err_cb(curl_easy_strerror(res));
+                    METRIC_INC(errors);
+                } else if (http_code != 200) {
+                    if (it->second->err_cb) it->second->err_cb("HTTP " + std::to_string(http_code));
+                    METRIC_INC(errors);
+                } else {
+                    METRIC_INC(success_count);
+                }
             }
             METRIC_DEC(active_requests);
             active_.erase(it);

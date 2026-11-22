@@ -10,6 +10,7 @@
 #include <drogon/HttpTypes.h>
 #include <trantor/net/EventLoop.h>
 #include "agent_types.h"
+#include "agent_runner.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <functional>
 
 namespace gw {
 
@@ -61,16 +63,36 @@ private:
                       double temperature,
                       int max_tokens);
 
+    // ─── 自主 Agent 循环 (新增) ────────────────────────────────────
+    void process_run(const drogon::WebSocketConnectionPtr& conn,
+                     const std::string& request_id,
+                     const std::string& model,
+                     const std::string& messages_json,
+                     const std::string& tools_json,
+                     double temperature,
+                     int max_tokens,
+                     int max_steps);
+
     void route_tool_call(const drogon::WebSocketConnectionPtr& sender,
                          const std::string& request_id,
                          const std::string& call_id,
                          const std::string& name,
                          const std::string& arguments_json);
 
+    // 通用路由：reply_conn（chat 模式回发客户端）与 reply_runner（run 模式回发循环）
+    // 二选一，由哪个非空决定。
+    void route_tool_call_ex(const std::string& request_id,
+                            const std::string& call_id,
+                            const std::string& name,
+                            const std::string& arguments_json,
+                            const drogon::WebSocketConnectionPtr& reply_conn,
+                            const std::shared_ptr<AgentRunner>& reply_runner);
+
     void route_tool_result(const drogon::WebSocketConnectionPtr& executor,
                            const std::string& request_id,
                            const std::string& call_id,
-                           const std::string& content);
+                           const std::string& content,
+                           bool success);
 
     // ─── agent 间调用 (新增) ──────────────────────────────────────
     void route_agent_call(const drogon::WebSocketConnectionPtr& caller,
@@ -107,9 +129,23 @@ private:
     std::vector<drogon::WebSocketConnectionPtr> executors_;
     size_t exec_rr_idx_ = 0;
 
-    // tool_call → 原始发起客户端映射
+    // tool_call 回传目标：chat 模式回给客户端 conn，run 模式回给 AgentRunner
+    struct ToolRoute {
+        drogon::WebSocketConnectionPtr conn;      // 可为空
+        std::shared_ptr<AgentRunner>   runner;    // 可为空
+    };
+
+    // tool_call → 目标映射（key = request_id:call_id）
     std::mutex pending_mu_;
-    std::unordered_map<std::string, drogon::WebSocketConnectionPtr> pending_tools_;
+    std::unordered_map<std::string, ToolRoute> pending_tools_;
+
+    // 进行中的 AgentRunner（key = request_id），用于 cancel / 断连清理
+    std::mutex runner_mu_;
+    struct RunnerEntry {
+        std::shared_ptr<AgentRunner> runner;
+        std::string                  session_id;
+    };
+    std::unordered_map<std::string, RunnerEntry> runners_;
 
     // agent_call → 发起方 conn 映射 (复用 pending_mu_)
     // key = call_id, value = caller conn
